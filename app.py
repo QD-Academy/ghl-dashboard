@@ -112,7 +112,7 @@ def run_fetch():
         "Version": API_VERSION, "Accept": "application/json",
     })
     now = datetime.now(timezone.utc)
-    start_ms = int((now - timedelta(days=90)).timestamp() * 1000)
+    start_ms = int((now - timedelta(days=180)).timestamp() * 1000)
     end_ms = int(now.timestamp() * 1000)
     data = ghl_get(session, "/conversations/search", {
         "locationId": location_id, "limit": 100,
