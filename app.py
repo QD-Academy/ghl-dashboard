@@ -1,446 +1,307 @@
 """
-app.py
--------
-Combined entry point for Railway deployment.
-Runs the data fetcher on a schedule AND serves the dashboard,
-all in one process — no need for two terminals.
+app.py - GHL Credit Usage Dashboard
+Runs fetcher on schedule + serves dashboard web UI.
 """
 
 import os
 import json
 import time
+import sqlite3
 import threading
+import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from flask import Flask, jsonify, render_template_string
-from apscheduler.schedulers.background import BackgroundScheduler
-
-from ghl_client import GHLClient
-from database import (
-    init_db, upsert_daily_usage, rebuild_monthly_from_daily,
-    upsert_transaction, set_last_fetch,
-    mark_conversation_processed,
-    get_available_months, get_monthly_summary, get_total_for_month,
-)
 
 app = Flask(__name__)
 
-# ----------------------------------------------------------
-# Config
-# ----------------------------------------------------------
-def load_config():
-    with open("config.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+DB_PATH = "/tmp/ghl_dashboard.db"
 
-# ----------------------------------------------------------
-# Message type → pricing key mapping
-# ----------------------------------------------------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_daily (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL,
+        service TEXT NOT NULL, message_count INTEGER DEFAULT 0,
+        cost REAL DEFAULT 0.0, UNIQUE(date, service))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_monthly (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,
+        service TEXT NOT NULL, message_count INTEGER DEFAULT 0,
+        cost REAL DEFAULT 0.0, UNIQUE(month, service))""")
+    conn.commit()
+    conn.close()
+    print("DB initialized.")
+
+init_db()
+
+PRICING = {
+    "whatsapp_marketing": 0.0769, "whatsapp_utility": 0.0119,
+    "email": 0.000675, "email_notification": 0.000972,
+    "email_verification": 0.0025, "conversation_voice_ai": 0.0023,
+    "reviews_ai": 0.0100, "workflow_premium": 0.0100,
+    "sms": 0.0079, "calls": 0.0,
+}
 MESSAGE_TYPE_MAP = {
-    "TYPE_WHATSAPP":               "whatsapp_marketing",
-    "TYPE_WHATSAPP_TEMPLATE":      "whatsapp_marketing",
-    "TYPE_WHATSAPP_MARKETING":     "whatsapp_marketing",
-    "TYPE_WHATSAPP_UTILITY":       "whatsapp_utility",
-    "TYPE_EMAIL":                  "email",
-    "TYPE_EMAIL_VERIFICATION":     "email_verification",
-    "TYPE_EMAIL_NOTIFICATION":     "email_notification",
-    "TYPE_SMS":                    "sms",
-    "TYPE_PHONE":                  "calls",
-    "TYPE_CALL":                   "calls",
-    "TYPE_CONVERSATION_AI":        "conversation_voice_ai",
-    "TYPE_VOICE_AI":               "conversation_voice_ai",
-    "TYPE_REVIEW_AI":              "reviews_ai",
+    "TYPE_WHATSAPP": "whatsapp_marketing",
+    "TYPE_WHATSAPP_TEMPLATE": "whatsapp_marketing",
+    "TYPE_WHATSAPP_MARKETING": "whatsapp_marketing",
+    "TYPE_WHATSAPP_UTILITY": "whatsapp_utility",
+    "TYPE_EMAIL": "email",
+    "TYPE_EMAIL_VERIFICATION": "email_verification",
+    "TYPE_EMAIL_NOTIFICATION": "email_notification",
+    "TYPE_SMS": "sms", "TYPE_PHONE": "calls", "TYPE_CALL": "calls",
+    "TYPE_CONVERSATION_AI": "conversation_voice_ai",
+    "TYPE_VOICE_AI": "conversation_voice_ai",
+    "TYPE_REVIEW_AI": "reviews_ai",
 }
-
 SERVICE_LABELS = {
-    "whatsapp_marketing":    "WhatsApp Marketing Message",
-    "whatsapp_utility":      "WhatsApp Utility Message",
-    "email":                 "Email",
-    "email_notification":    "Email Notification",
-    "email_verification":    "Email Verification",
+    "whatsapp_marketing": "WhatsApp Marketing Message",
+    "whatsapp_utility": "WhatsApp Utility Message",
+    "email": "Email", "email_notification": "Email Notification",
+    "email_verification": "Email Verification",
     "conversation_voice_ai": "Conversation & Voice AI",
-    "reviews_ai":            "Reviews AI",
-    "workflow_premium":      "Workflow Premium Features",
-    "sms":                   "SMS",
-    "calls":                 "Calls",
-    "other":                 "Other",
+    "reviews_ai": "Reviews AI",
+    "workflow_premium": "Workflow Premium Features",
+    "sms": "SMS", "calls": "Calls", "other": "Other",
 }
-
 SERVICE_COLORS = {
-    "whatsapp_marketing":    "#4f46e5",
-    "whatsapp_utility":      "#7c3aed",
-    "email":                 "#0891b2",
-    "email_notification":    "#0284c7",
-    "email_verification":    "#059669",
-    "conversation_voice_ai": "#d97706",
-    "reviews_ai":            "#dc2626",
-    "workflow_premium":      "#7c3aed",
-    "sms":                   "#16a34a",
-    "calls":                 "#9333ea",
-    "other":                 "#6b7280",
+    "whatsapp_marketing": "#4f46e5", "whatsapp_utility": "#7c3aed",
+    "email": "#0891b2", "email_notification": "#0284c7",
+    "email_verification": "#059669", "conversation_voice_ai": "#d97706",
+    "reviews_ai": "#dc2626", "workflow_premium": "#7c3aed",
+    "sms": "#16a34a", "calls": "#9333ea", "other": "#6b7280",
 }
 
-# Track last successful fetch time
+BASE_URL = "https://services.leadconnectorhq.com"
+API_VERSION = "2021-07-28"
 last_fetch_time = None
 
-
-# ----------------------------------------------------------
-# Fetcher logic
-# ----------------------------------------------------------
-def map_message_type(raw_type: str) -> str:
-    if not raw_type:
-        return "other"
-    return MESSAGE_TYPE_MAP.get(raw_type.upper().strip(), "other")
-
+def ghl_get(session, path, params={}):
+    url = f"{BASE_URL}{path}"
+    for _ in range(3):
+        try:
+            r = session.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(10)
+                continue
+            print(f"API {r.status_code}: {path}")
+            return {}
+        except Exception as e:
+            print(f"Request error: {e}")
+            time.sleep(2)
+    return {}
 
 def run_fetch():
     global last_fetch_time
-    try:
-        config      = load_config()
-        pricing     = config.get("pricing", {})
-        token       = os.getenv("GHL_ACCESS_TOKEN")
-        location_id = os.getenv("GHL_LOCATION_ID") or config.get("location_id")
-
-        if not token:
-            print("❌ GHL_ACCESS_TOKEN not set. Skipping fetch.")
-            return
-
-        client     = GHLClient(token, location_id)
-        now        = datetime.now(timezone.utc)
-        start_date = (now - timedelta(days=90)).strftime("%Y-%m-%d")
-        end_date   = now.strftime("%Y-%m-%d")
-
-        print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] Fetching data...")
-
-        # Get conversations
-        conversations = client.get_conversations(start_date, end_date)
-        print(f"  Found {len(conversations)} conversations")
-
-        daily_counts = defaultdict(lambda: defaultdict(int))
-
-        for i, convo in enumerate(conversations):
-            convo_id = convo.get("id")
-            try:
-                messages = client.get_messages(convo_id)
-                for msg in messages:
-                    msg_date = msg.get("dateAdded") or msg.get("createdAt", "")
-                    if isinstance(msg_date, (int, float)):
-                        dt = datetime.fromtimestamp(msg_date / 1000, tz=timezone.utc)
-                    else:
-                        try:
-                            dt = datetime.fromisoformat(msg_date.replace("Z", "+00:00"))
-                        except Exception:
-                            dt = now
-                    date_str    = dt.strftime("%Y-%m-%d")
-                    raw_type    = msg.get("messageType") or msg.get("type", "")
-                    service_key = map_message_type(raw_type)
-                    direction   = msg.get("direction", "").upper()
-                    if direction in ("OUTBOUND", "SENT", "") or not direction:
-                        daily_counts[date_str][service_key] += 1
-                mark_conversation_processed(convo_id, len(messages))
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"  ⚠ Skipped {convo_id}: {e}")
-                continue
-
-        # Save to DB
-        for date_str, services in daily_counts.items():
-            for service_key, count in services.items():
-                rate = pricing.get(service_key, 0.0)
-                upsert_daily_usage(date_str, service_key, count, count * rate)
-
-        rebuild_monthly_from_daily()
-
-        # Fetch transactions
+    token = os.getenv("GHL_ACCESS_TOKEN")
+    location_id = os.getenv("GHL_LOCATION_ID")
+    if not token or not location_id:
+        print("Missing credentials")
+        return
+    print(f"Fetching at {datetime.now(timezone.utc).strftime('%H:%M:%S')}...")
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Version": API_VERSION, "Accept": "application/json",
+    })
+    now = datetime.now(timezone.utc)
+    start_ms = int((now - timedelta(days=90)).timestamp() * 1000)
+    end_ms = int(now.timestamp() * 1000)
+    data = ghl_get(session, "/conversations/search", {
+        "locationId": location_id, "limit": 100,
+        "startAfterDate": start_ms, "endDate": end_ms,
+    })
+    convos = data.get("conversations", [])
+    print(f"Found {len(convos)} conversations")
+    daily = defaultdict(lambda: defaultdict(int))
+    for convo in convos:
+        cid = convo.get("id")
+        if not cid:
+            continue
         try:
-            txns = client.get_transactions(start_date, end_date)
-            for txn in txns:
-                upsert_transaction(txn)
+            md = ghl_get(session, f"/conversations/{cid}/messages", {"limit": 100})
+            msgs = md.get("messages", {})
+            if isinstance(msgs, dict):
+                msgs = msgs.get("messages", [])
+            for msg in msgs:
+                d = msg.get("dateAdded") or msg.get("createdAt", "")
+                if isinstance(d, (int, float)):
+                    dt = datetime.fromtimestamp(d/1000, tz=timezone.utc)
+                else:
+                    try:
+                        dt = datetime.fromisoformat(str(d).replace("Z", "+00:00"))
+                    except:
+                        dt = now
+                ds = dt.strftime("%Y-%m-%d")
+                rt = msg.get("messageType") or msg.get("type", "")
+                sk = MESSAGE_TYPE_MAP.get(rt.upper().strip() if rt else "", "other")
+                dr = msg.get("direction", "").upper()
+                if dr in ("OUTBOUND", "SENT", "") or not dr:
+                    daily[ds][sk] += 1
+            time.sleep(0.1)
         except Exception as e:
-            print(f"  ⚠ Transactions error: {e}")
+            print(f"Skip {cid}: {e}")
+    conn = get_db()
+    for ds, svcs in daily.items():
+        for sk, cnt in svcs.items():
+            rate = PRICING.get(sk, 0.0)
+            conn.execute("""INSERT INTO usage_daily (date,service,message_count,cost)
+                VALUES(?,?,?,?) ON CONFLICT(date,service) DO UPDATE SET
+                message_count=excluded.message_count,cost=excluded.cost""",
+                (ds, sk, cnt, cnt*rate))
+    conn.execute("DELETE FROM usage_monthly")
+    conn.execute("""INSERT INTO usage_monthly(month,service,message_count,cost)
+        SELECT substr(date,1,7),service,SUM(message_count),SUM(cost)
+        FROM usage_daily GROUP BY substr(date,1,7),service""")
+    conn.commit()
+    conn.close()
+    last_fetch_time = datetime.now(timezone.utc)
+    print("Fetch complete.")
 
-        set_last_fetch("conversations")
-        last_fetch_time = datetime.now(timezone.utc)
-        print(f"  ✅ Fetch complete.")
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
-    except Exception as e:
-        print(f"❌ Fetch failed: {e}")
-
-
-# ----------------------------------------------------------
-# API endpoint
-# ----------------------------------------------------------
 @app.route("/api/data")
 def api_data():
-    months = get_available_months()
-    if not months:
-        return jsonify({"months": [], "data": {}})
+    try:
+        conn = get_db()
+        months = [r[0] for r in conn.execute(
+            "SELECT DISTINCT month FROM usage_monthly ORDER BY month DESC").fetchall()]
+        result = {}
+        for i, month in enumerate(months):
+            rows = conn.execute(
+                "SELECT service,message_count,cost FROM usage_monthly WHERE month=? ORDER BY cost DESC",
+                (month,)).fetchall()
+            total = sum(r["cost"] for r in rows)
+            prev = months[i+1] if i+1 < len(months) else None
+            pt = 0
+            if prev:
+                pr = conn.execute("SELECT COALESCE(SUM(cost),0) t FROM usage_monthly WHERE month=?", (prev,)).fetchone()
+                pt = pr["t"] if pr else 0
+            mom = ((total-pt)/pt*100) if pt > 0 else (100 if total > 0 else 0)
+            cards = []
+            for r in rows:
+                if r["cost"]==0 and r["message_count"]==0:
+                    continue
+                pct = (r["cost"]/total*100) if total > 0 else 0
+                cards.append({
+                    "service": r["service"],
+                    "label": SERVICE_LABELS.get(r["service"], r["service"]),
+                    "color": SERVICE_COLORS.get(r["service"], "#6b7280"),
+                    "message_count": r["message_count"],
+                    "cost": round(r["cost"], 4),
+                    "pct_of_total": round(pct, 1),
+                })
+            result[month] = {"total": round(total,4), "prev_total": round(pt,4),
+                "mom_pct": round(mom,1), "prev_month": prev, "cards": cards}
+        conn.close()
+        ls = last_fetch_time.strftime("%Y-%m-%d %H:%M UTC") if last_fetch_time else "Fetching..."
+        return jsonify({"months": months, "data": result, "last_sync": ls})
+    except Exception as e:
+        print(f"API error: {e}")
+        return jsonify({"error": str(e), "months": [], "data": {}}), 500
 
-    result = {}
-    for month in months:
-        summary    = get_monthly_summary(month)
-        total      = get_total_for_month(month)
-        idx        = months.index(month)
-        prev_month = months[idx + 1] if idx + 1 < len(months) else None
-        prev_total = get_total_for_month(prev_month) if prev_month else 0
-
-        if prev_total > 0:
-            mom_pct = ((total - prev_total) / prev_total) * 100
-        elif total > 0:
-            mom_pct = 100
-        else:
-            mom_pct = 0
-
-        cards = []
-        for row in summary:
-            if row["cost"] == 0 and row["message_count"] == 0:
-                continue
-            service = row["service"]
-            pct     = (row["cost"] / total * 100) if total > 0 else 0
-            cards.append({
-                "service":       service,
-                "label":         SERVICE_LABELS.get(service, service),
-                "color":         SERVICE_COLORS.get(service, "#6b7280"),
-                "message_count": row["message_count"],
-                "cost":          round(row["cost"], 4),
-                "pct_of_total":  round(pct, 1),
-            })
-
-        result[month] = {
-            "total":      round(total, 4),
-            "prev_total": round(prev_total, 4),
-            "mom_pct":    round(mom_pct, 1),
-            "prev_month": prev_month,
-            "cards":      cards,
-        }
-
-    last_sync = last_fetch_time.strftime("%Y-%m-%d %H:%M UTC") if last_fetch_time else "Not yet"
-    return jsonify({"months": months, "data": result, "last_sync": last_sync})
-
-
-# ----------------------------------------------------------
-# Dashboard HTML
-# ----------------------------------------------------------
-DASHBOARD_HTML = """
-<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>QD Academy — Credit Usage</title>
+  <title>Credit Usage — QD Academy</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #f4f6f9; color: #1a1a2e; min-height: 100vh;
-    }
-    .header {
-      background: #fff; border-bottom: 1px solid #e5e7eb;
-      padding: 16px 24px; display: flex;
-      align-items: center; justify-content: space-between;
-    }
-    .header h1 { font-size: 18px; font-weight: 600; color: #111827; }
-    .header .subtitle { font-size: 13px; color: #6b7280; margin-top: 2px; }
-    .sync-info { font-size: 12px; color: #9ca3af; text-align: right; }
-    .tabs-wrapper {
-      background: #fff; border-bottom: 1px solid #e5e7eb; padding: 0 24px;
-      overflow-x: auto;
-    }
-    .tabs { display: flex; gap: 4px; min-width: max-content; }
-    .tab {
-      padding: 14px 20px; font-size: 14px; font-weight: 500;
-      color: #6b7280; cursor: pointer;
-      border-bottom: 2px solid transparent; transition: all 0.15s;
-      white-space: nowrap;
-    }
-    .tab:hover { color: #4f46e5; }
-    .tab.active { color: #4f46e5; border-bottom-color: #4f46e5; font-weight: 600; }
-    .content { padding: 24px; max-width: 960px; margin: 0 auto; }
-    .total-banner {
-      margin-bottom: 24px; display: flex;
-      align-items: center; gap: 12px; flex-wrap: wrap;
-    }
-    .total-amount { font-size: 26px; font-weight: 700; color: #111827; }
-    .total-label  { font-size: 15px; color: #6b7280; }
-    .mom-badge {
-      display: inline-flex; align-items: center; gap: 4px;
-      padding: 4px 10px; border-radius: 20px;
-      font-size: 13px; font-weight: 600;
-    }
-    .mom-up   { background: #dcfce7; color: #16a34a; }
-    .mom-down { background: #fee2e2; color: #dc2626; }
-    .mom-flat { background: #f3f4f6; color: #6b7280; }
-    .cards-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 20px;
-      border: 1px solid #e5e7eb; transition: box-shadow 0.15s;
-    }
-    .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-    .card-title { font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 10px; }
-    .card-row {
-      display: flex; align-items: baseline;
-      justify-content: space-between; margin-bottom: 10px;
-    }
-    .card-cost  { font-size: 22px; font-weight: 700; }
-    .card-prev  { font-size: 12px; color: #9ca3af; }
-    .progress-bar-bg {
-      height: 5px; background: #f3f4f6;
-      border-radius: 99px; margin-bottom: 8px; overflow: hidden;
-    }
-    .progress-bar-fill {
-      height: 100%; border-radius: 99px; transition: width 0.5s ease;
-    }
-    .card-pct   { font-size: 12px; color: #6b7280; }
-    .card-count { font-size: 11px; color: #9ca3af; margin-top: 4px; }
-    .empty {
-      text-align: center; padding: 60px 20px; color: #9ca3af;
-    }
-    .empty h2 { font-size: 18px; margin-bottom: 8px; color: #6b7280; }
-    .loading { text-align: center; padding: 60px; color: #6b7280; font-size: 15px; }
-    .footer {
-      text-align: center; font-size: 12px; color: #9ca3af;
-      margin-top: 32px; padding-bottom: 24px;
-    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f6f9;min-height:100vh}
+    .header{background:#fff;border-bottom:1px solid #e5e7eb;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+    .header h1{font-size:18px;font-weight:600;color:#111827}
+    .sub{font-size:13px;color:#6b7280;margin-top:2px}
+    .sync{font-size:12px;color:#9ca3af}
+    .tabs-wrap{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;overflow-x:auto}
+    .tabs{display:flex;gap:4px;min-width:max-content}
+    .tab{padding:14px 20px;font-size:14px;font-weight:500;color:#6b7280;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+    .tab.active{color:#4f46e5;border-bottom-color:#4f46e5;font-weight:600}
+    .content{padding:24px;max-width:960px;margin:0 auto}
+    .banner{margin-bottom:24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+    .amount{font-size:26px;font-weight:700;color:#111827}
+    .lbl{font-size:15px;color:#6b7280}
+    .badge{display:inline-flex;align-items:center;padding:4px 10px;border-radius:20px;font-size:13px;font-weight:600}
+    .up{background:#dcfce7;color:#16a34a}.down{background:#fee2e2;color:#dc2626}.flat{background:#f3f4f6;color:#6b7280}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+    .card{background:#fff;border-radius:12px;padding:20px;border:1px solid #e5e7eb}
+    .card:hover{box-shadow:0 4px 12px rgba(0,0,0,.08)}
+    .ct{font-size:13px;font-weight:600;color:#374151;margin-bottom:10px}
+    .cr{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
+    .cc{font-size:22px;font-weight:700}.cp{font-size:12px;color:#9ca3af}
+    .bg{height:5px;background:#f3f4f6;border-radius:99px;margin-bottom:8px;overflow:hidden}
+    .fill{height:100%;border-radius:99px}
+    .pct{font-size:12px;color:#6b7280}.cnt{font-size:11px;color:#9ca3af;margin-top:4px}
+    .empty{text-align:center;padding:60px;color:#9ca3af}
+    .loading{text-align:center;padding:60px;color:#6b7280}
   </style>
 </head>
 <body>
 <div class="header">
-  <div>
-    <h1>Credit Usage Dashboard</h1>
-    <div class="subtitle">QD Academy — GoHighLevel</div>
-  </div>
-  <div class="sync-info" id="sync-info">Loading...</div>
+  <div><h1>Credit Usage Dashboard</h1><div class="sub">QD Academy — GoHighLevel</div></div>
+  <div class="sync" id="sync">Loading...</div>
 </div>
-<div class="tabs-wrapper">
-  <div class="tabs" id="tabs"></div>
-</div>
-<div class="content">
-  <div id="main" class="loading">Loading data...</div>
-</div>
-<div class="footer" id="footer"></div>
-
+<div class="tabs-wrap"><div class="tabs" id="tabs"></div></div>
+<div class="content"><div id="main" class="loading">Loading data...</div></div>
 <script>
-  let allData = {}, allMonths = [], activeMonth = null;
-
-  function formatMonth(m) {
-    const [y, mo] = m.split("-");
-    const names = ["Jan","Feb","Mar","Apr","May","Jun",
-                   "Jul","Aug","Sep","Oct","Nov","Dec"];
-    return names[parseInt(mo)-1] + " " + y;
-  }
-
-  function renderTabs() {
-    document.getElementById("tabs").innerHTML = allMonths.map(m => `
-      <div class="tab ${m===activeMonth?'active':''}" onclick="switchMonth('${m}')">
-        ${formatMonth(m)}
-      </div>`).join("");
-  }
-
-  function switchMonth(m) {
-    activeMonth = m; renderTabs(); renderContent();
-  }
-
-  function renderContent() {
-    const main = document.getElementById("main");
-    const d    = allData[activeMonth];
-    if (!d) {
-      main.innerHTML = '<div class="empty"><h2>No data for this month</h2></div>';
-      return;
-    }
-    let momHtml = "";
-    if (d.prev_month) {
-      const pct  = d.mom_pct;
-      const cls  = pct>0?"mom-up":pct<0?"mom-down":"mom-flat";
-      const sign = pct>0?"↑":pct<0?"↓":"→";
-      const abs  = Math.abs(pct);
-      const label = abs>100?`>100% ${sign}`:`${abs.toFixed(1)}% ${sign}`;
-      momHtml = `<span class="mom-badge ${cls}">${label}</span>
-                 <span class="total-label">vs ${formatMonth(d.prev_month)}</span>`;
-    }
-    let cardsHtml = d.cards.length === 0
-      ? '<div class="empty"><h2>No usage recorded this month</h2></div>'
-      : '<div class="cards-grid">' + d.cards.map(card => `
-          <div class="card">
-            <div class="card-title">${card.label}</div>
-            <div class="card-row">
-              <span class="card-cost" style="color:${card.color}">
-                $${card.cost.toFixed(4)}
-              </span>
-              <span class="card-prev">from $0</span>
-            </div>
-            <div class="progress-bar-bg">
-              <div class="progress-bar-fill"
-                   style="width:${card.pct_of_total}%;background:${card.color}">
-              </div>
-            </div>
-            <div class="card-pct">${card.pct_of_total}% of total</div>
-            <div class="card-count">${card.message_count.toLocaleString()} transactions</div>
-          </div>`).join("") + "</div>";
-
-    main.innerHTML = `
-      <div class="total-banner">
-        <span class="total-amount">$${d.total.toFixed(2)}</span>
-        <span class="total-label">total for ${formatMonth(activeMonth)}</span>
-        ${momHtml}
-      </div>
-      ${cardsHtml}`;
-  }
-
-  async function loadData() {
-    try {
-      const resp = await fetch("/api/data");
-      const json = await resp.json();
-      allMonths = json.months || [];
-      allData   = json.data   || {};
-      document.getElementById("sync-info").textContent =
-        "Last synced: " + (json.last_sync || "Unknown");
-      if (allMonths.length === 0) {
-        document.getElementById("main").innerHTML =
-          '<div class="empty"><h2>No data yet</h2><p>Fetcher is warming up...</p></div>';
-        return;
-      }
-      if (!activeMonth || !allMonths.includes(activeMonth)) {
-        activeMonth = allMonths[0];
-      }
-      renderTabs();
-      renderContent();
-    } catch(e) {
-      document.getElementById("main").innerHTML =
-        '<div class="empty"><h2>Failed to load</h2><p>'+e.message+'</p></div>';
-    }
-  }
-
-  loadData();
-  setInterval(loadData, 15 * 60 * 1000);
+let D={},M=[],A=null;
+const N=m=>{const[y,mo]=m.split('-');return['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][+mo-1]+' '+y};
+const tabs=()=>document.getElementById('tabs').innerHTML=M.map(m=>`<div class="tab ${m===A?'active':''}" onclick="sw('${m}')">${N(m)}</div>`).join('');
+const sw=m=>{A=m;tabs();render()};
+const render=()=>{
+  const el=document.getElementById('main'),d=D[A];
+  if(!d){el.innerHTML='<div class="empty"><h2>No data</h2></div>';return}
+  let mom='';
+  if(d.prev_month){const p=d.mom_pct,c=p>0?'up':p<0?'down':'flat',s=p>0?'↑':p<0?'↓':'→',a=Math.abs(p);
+    mom=`<span class="badge ${c}">${a>100?'>100%':a.toFixed(1)+'%'} ${s}</span><span class="lbl">vs ${N(d.prev_month)}</span>`}
+  const cards=d.cards.length?'<div class="grid">'+d.cards.map(c=>`
+    <div class="card"><div class="ct">${c.label}</div>
+    <div class="cr"><span class="cc" style="color:${c.color}">$${c.cost.toFixed(4)}</span><span class="cp">from $0</span></div>
+    <div class="bg"><div class="fill" style="width:${c.pct_of_total}%;background:${c.color}"></div></div>
+    <div class="pct">${c.pct_of_total}% of total</div>
+    <div class="cnt">${c.message_count.toLocaleString()} transactions</div></div>`).join('')+'</div>':
+    '<div class="empty"><h2>No usage this month</h2></div>';
+  el.innerHTML=`<div class="banner"><span class="amount">$${d.total.toFixed(2)}</span><span class="lbl">total for ${N(A)}</span>${mom}</div>${cards}`;
+};
+async function load(){
+  try{
+    const r=await fetch('/api/data'),j=await r.json();
+    if(j.error){document.getElementById('main').innerHTML=`<div class="empty"><h2>${j.error}</h2></div>`;return}
+    M=j.months||[];D=j.data||{};
+    document.getElementById('sync').textContent='Last synced: '+(j.last_sync||'pending');
+    if(!M.length){document.getElementById('main').innerHTML='<div class="empty"><h2>Fetching from GHL...</h2><p>Check back in 2 minutes.</p></div>';return}
+    if(!A||!M.includes(A))A=M[0];tabs();render();
+  }catch(e){document.getElementById('main').innerHTML=`<div class="empty"><h2>${e.message}</h2></div>`}
+}
+load();setInterval(load,15*60*1000);
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML)
 
+def scheduler():
+    time.sleep(5)
+    while True:
+        try:
+            run_fetch()
+        except Exception as e:
+            print(f"Scheduler error: {e}")
+        time.sleep(15*60)
 
-# ----------------------------------------------------------
-# Start scheduler + server
-# ----------------------------------------------------------
+threading.Thread(target=scheduler, daemon=True).start()
+
 if __name__ == "__main__":
-    init_db()
-
-    # Run first fetch immediately in background
-    thread = threading.Thread(target=run_fetch, daemon=True)
-    thread.start()
-
-    # Schedule fetch every 15 minutes
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_fetch, "interval", minutes=15)
-    scheduler.start()
-
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n✅ App starting on port {port}")
-    print(f"   Dashboard: http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
