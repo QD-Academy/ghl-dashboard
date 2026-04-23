@@ -1,0 +1,4 @@
+ghl_dashboard.db
+__pycache__/
+*.pyc
+.env

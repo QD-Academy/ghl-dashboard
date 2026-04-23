@@ -1,0 +1,17 @@
+{
+  "location_id": "0Su6wVzIbeEhWLafOY84",
+  "currency": "USD",
+  "pricing": {
+    "whatsapp_marketing": 0.0769,
+    "whatsapp_utility": 0.0119,
+    "email": 0.000675,
+    "email_notification": 0.000972,
+    "email_verification": 0.0025,
+    "conversation_voice_ai": 0.0023,
+    "reviews_ai": 0.01,
+    "workflow_premium": 0.01,
+    "sms": 0.0079,
+    "calls": 0.0
+  },
+  "refresh_interval_minutes": 15
+}
