@@ -105,6 +105,8 @@ def get_all_conversations(s, loc, start_ms, end_ms):
             "limit": 100,
             "startAfterDate": start_ms,
             "endDate": end_ms,
+            "sortBy": "last_message_date",
+            "sortOrder": "desc",
         }
         if last_msg_id:
             params["lastMessageId"] = last_msg_id
