@@ -100,7 +100,7 @@ def get_all_conversations(s, loc, start_ms, end_ms):
     page = 1
 
     MAX_PAGES = 100
-    while True:
+    while page <= MAX_PAGES:
         params = {
             "locationId": loc,
             "limit": 100,
