@@ -99,6 +99,7 @@ def get_all_conversations(s, loc, start_ms, end_ms):
     last_msg_id = None
     page = 1
 
+    MAX_PAGES = 100
     while True:
         params = {
             "locationId": loc,
