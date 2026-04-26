@@ -1,20 +1,15 @@
 """
-app.py - GHL Credit Usage Dashboard
-Runs fetcher on schedule + serves dashboard web UI.
+app.py - GHL Credit Usage Dashboard (Enhanced UI)
+Matches GHL's Product Breakup layout with trend chart,
+per-card MoM %, and proper from/to values.
 """
 
-import os
-import json
-import time
-import sqlite3
-import threading
-import requests
+import os, time, sqlite3, threading, requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
-
 DB_PATH = "/tmp/ghl_dashboard.db"
 
 def get_db():
@@ -24,29 +19,28 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS usage_daily (
+    conn.execute("""CREATE TABLE IF NOT EXISTS usage_daily (
         id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL,
         service TEXT NOT NULL, message_count INTEGER DEFAULT 0,
         cost REAL DEFAULT 0.0, UNIQUE(date, service))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS usage_monthly (
+    conn.execute("""CREATE TABLE IF NOT EXISTS usage_monthly (
         id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,
         service TEXT NOT NULL, message_count INTEGER DEFAULT 0,
         cost REAL DEFAULT 0.0, UNIQUE(month, service))""")
     conn.commit()
     conn.close()
-    print("DB initialized.")
+    print("DB ready.")
 
 init_db()
 
 PRICING = {
     "whatsapp_marketing": 0.0769, "whatsapp_utility": 0.0119,
-    "email": 0.000675, "email_notification": 0.000972,
-    "email_verification": 0.0025, "conversation_voice_ai": 0.0023,
+    "email": 0.000675, "email_notification": 0.000960,
+    "email_verification": 0.0025, "conversation_voice_ai": 0.0024,
     "reviews_ai": 0.0100, "workflow_premium": 0.0100,
-    "sms": 0.0079, "calls": 0.0,
+    "workflow_external_ai": 0.0081, "sms": 0.0079, "calls": 0.0,
 }
-MESSAGE_TYPE_MAP = {
+MSG_MAP = {
     "TYPE_WHATSAPP": "whatsapp_marketing",
     "TYPE_WHATSAPP_TEMPLATE": "whatsapp_marketing",
     "TYPE_WHATSAPP_MARKETING": "whatsapp_marketing",
@@ -58,152 +52,141 @@ MESSAGE_TYPE_MAP = {
     "TYPE_CONVERSATION_AI": "conversation_voice_ai",
     "TYPE_VOICE_AI": "conversation_voice_ai",
     "TYPE_REVIEW_AI": "reviews_ai",
+    "TYPE_WORKFLOW_PREMIUM": "workflow_premium",
 }
-SERVICE_LABELS = {
-    "whatsapp_marketing": "WhatsApp Marketing Message",
-    "whatsapp_utility": "WhatsApp Utility Message",
+LABELS = {
+    "whatsapp_marketing": "WhatsApp Marketing",
+    "whatsapp_utility": "WhatsApp Utility",
     "email": "Email", "email_notification": "Email Notification",
     "email_verification": "Email Verification",
     "conversation_voice_ai": "Conversation & Voice AI",
     "reviews_ai": "Reviews AI",
-    "workflow_premium": "Workflow Premium Features",
+    "workflow_premium": "Workflow Premium Actions",
+    "workflow_external_ai": "Workflow External AI",
     "sms": "SMS", "calls": "Calls", "other": "Other",
 }
-SERVICE_COLORS = {
+COLORS = {
     "whatsapp_marketing": "#4f46e5", "whatsapp_utility": "#7c3aed",
-    "email": "#0891b2", "email_notification": "#0284c7",
+    "email": "#0284c7", "email_notification": "#0891b2",
     "email_verification": "#059669", "conversation_voice_ai": "#d97706",
-    "reviews_ai": "#dc2626", "workflow_premium": "#7c3aed",
-    "sms": "#16a34a", "calls": "#9333ea", "other": "#6b7280",
+    "reviews_ai": "#dc2626", "workflow_premium": "#9333ea",
+    "workflow_external_ai": "#c026d3", "sms": "#16a34a",
+    "calls": "#64748b", "other": "#6b7280",
 }
 
 BASE_URL = "https://services.leadconnectorhq.com"
-API_VERSION = "2021-07-28"
-last_fetch_time = None
+API_VER = "2021-07-28"
+last_fetch = None
 
-def ghl_get(session, path, params={}):
-    url = f"{BASE_URL}{path}"
+def ghl_get(s, path, p={}):
     for _ in range(3):
         try:
-            r = session.get(url, params=params, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                time.sleep(10)
-                continue
-            print(f"API {r.status_code}: {path}")
+            r = s.get(f"{BASE_URL}{path}", params=p, timeout=30)
+            if r.status_code == 200: return r.json()
+            if r.status_code == 429: time.sleep(10); continue
             return {}
-        except Exception as e:
-            print(f"Request error: {e}")
-            time.sleep(2)
+        except: time.sleep(2)
     return {}
 
 def run_fetch():
-    global last_fetch_time
+    global last_fetch
     token = os.getenv("GHL_ACCESS_TOKEN")
-    location_id = os.getenv("GHL_LOCATION_ID")
-    if not token or not location_id:
-        print("Missing credentials")
-        return
-    print(f"Fetching at {datetime.now(timezone.utc).strftime('%H:%M:%S')}...")
-    session = requests.Session()
-    session.headers.update({
-        "Authorization": f"Bearer {token}",
-        "Version": API_VERSION, "Accept": "application/json",
-    })
+    loc = os.getenv("GHL_LOCATION_ID")
+    if not token or not loc: print("No creds"); return
+    s = requests.Session()
+    s.headers.update({"Authorization": f"Bearer {token}", "Version": API_VER, "Accept": "application/json"})
     now = datetime.now(timezone.utc)
-    start_ms = int((now - timedelta(days=180)).timestamp() * 1000)
-    end_ms = int(now.timestamp() * 1000)
-    data = ghl_get(session, "/conversations/search", {
-        "locationId": location_id, "limit": 100,
-        "startAfterDate": start_ms, "endDate": end_ms,
-    })
-    convos = data.get("conversations", [])
-    print(f"Found {len(convos)} conversations")
+    sms = int((now - timedelta(days=180)).timestamp() * 1000)
+    ems = int(now.timestamp() * 1000)
+    d = ghl_get(s, "/conversations/search", {"locationId": loc, "limit": 100, "startAfterDate": sms, "endDate": ems})
+    convos = d.get("conversations", [])
+    print(f"Fetching {len(convos)} conversations...")
     daily = defaultdict(lambda: defaultdict(int))
-    for convo in convos:
-        cid = convo.get("id")
-        if not cid:
-            continue
+    for c in convos:
+        cid = c.get("id")
+        if not cid: continue
         try:
-            md = ghl_get(session, f"/conversations/{cid}/messages", {"limit": 100})
+            md = ghl_get(s, f"/conversations/{cid}/messages", {"limit": 100})
             msgs = md.get("messages", {})
-            if isinstance(msgs, dict):
-                msgs = msgs.get("messages", [])
-            for msg in msgs:
-                d = msg.get("dateAdded") or msg.get("createdAt", "")
-                if isinstance(d, (int, float)):
-                    dt = datetime.fromtimestamp(d/1000, tz=timezone.utc)
+            if isinstance(msgs, dict): msgs = msgs.get("messages", [])
+            for m in msgs:
+                da = m.get("dateAdded") or m.get("createdAt", "")
+                if isinstance(da, (int, float)): dt = datetime.fromtimestamp(da/1000, tz=timezone.utc)
                 else:
-                    try:
-                        dt = datetime.fromisoformat(str(d).replace("Z", "+00:00"))
-                    except:
-                        dt = now
+                    try: dt = datetime.fromisoformat(str(da).replace("Z", "+00:00"))
+                    except: dt = now
                 ds = dt.strftime("%Y-%m-%d")
-                rt = msg.get("messageType") or msg.get("type", "")
-                sk = MESSAGE_TYPE_MAP.get(rt.upper().strip() if rt else "", "other")
-                dr = msg.get("direction", "").upper()
-                if dr in ("OUTBOUND", "SENT", "") or not dr:
-                    daily[ds][sk] += 1
+                rt = m.get("messageType") or m.get("type", "")
+                sk = MSG_MAP.get(rt.upper().strip() if rt else "", "other")
+                dr = m.get("direction", "").upper()
+                if dr in ("OUTBOUND", "SENT", "") or not dr: daily[ds][sk] += 1
             time.sleep(0.1)
-        except Exception as e:
-            print(f"Skip {cid}: {e}")
+        except Exception as e: print(f"Skip {cid}: {e}")
     conn = get_db()
-    for ds, svcs in daily.items():
-        for sk, cnt in svcs.items():
-            rate = PRICING.get(sk, 0.0)
-            conn.execute("""INSERT INTO usage_daily (date,service,message_count,cost)
-                VALUES(?,?,?,?) ON CONFLICT(date,service) DO UPDATE SET
-                message_count=excluded.message_count,cost=excluded.cost""",
-                (ds, sk, cnt, cnt*rate))
+    for ds, sv in daily.items():
+        for sk, cnt in sv.items():
+            conn.execute("INSERT INTO usage_daily(date,service,message_count,cost) VALUES(?,?,?,?) ON CONFLICT(date,service) DO UPDATE SET message_count=excluded.message_count,cost=excluded.cost",
+                (ds, sk, cnt, cnt * PRICING.get(sk, 0)))
     conn.execute("DELETE FROM usage_monthly")
-    conn.execute("""INSERT INTO usage_monthly(month,service,message_count,cost)
-        SELECT substr(date,1,7),service,SUM(message_count),SUM(cost)
-        FROM usage_daily GROUP BY substr(date,1,7),service""")
-    conn.commit()
-    conn.close()
-    last_fetch_time = datetime.now(timezone.utc)
-    print("Fetch complete.")
+    conn.execute("INSERT INTO usage_monthly(month,service,message_count,cost) SELECT substr(date,1,7),service,SUM(message_count),SUM(cost) FROM usage_daily GROUP BY substr(date,1,7),service")
+    conn.commit(); conn.close()
+    last_fetch = datetime.now(timezone.utc)
+    print("Fetch done.")
 
 @app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+def health(): return jsonify({"status": "ok"})
 
 @app.route("/api/data")
 def api_data():
     try:
         conn = get_db()
-        months = [r[0] for r in conn.execute(
-            "SELECT DISTINCT month FROM usage_monthly ORDER BY month DESC").fetchall()]
+        months = [r[0] for r in conn.execute("SELECT DISTINCT month FROM usage_monthly ORDER BY month DESC").fetchall()]
         result = {}
         for i, month in enumerate(months):
-            rows = conn.execute(
-                "SELECT service,message_count,cost FROM usage_monthly WHERE month=? ORDER BY cost DESC",
-                (month,)).fetchall()
+            rows = conn.execute("SELECT service,message_count,cost FROM usage_monthly WHERE month=? ORDER BY cost DESC", (month,)).fetchall()
             total = sum(r["cost"] for r in rows)
             prev = months[i+1] if i+1 < len(months) else None
             pt = 0
+            prev_services = {}
             if prev:
                 pr = conn.execute("SELECT COALESCE(SUM(cost),0) t FROM usage_monthly WHERE month=?", (prev,)).fetchone()
                 pt = pr["t"] if pr else 0
-            mom = ((total-pt)/pt*100) if pt > 0 else (100 if total > 0 else 0)
+                prev_rows = conn.execute("SELECT service,cost FROM usage_monthly WHERE month=?", (prev,)).fetchall()
+                prev_services = {r["service"]: r["cost"] for r in prev_rows}
+            mom = ((total - pt) / pt * 100) if pt > 0 else (100 if total > 0 else 0)
             cards = []
             for r in rows:
-                if r["cost"]==0 and r["message_count"]==0:
-                    continue
-                pct = (r["cost"]/total*100) if total > 0 else 0
+                if r["cost"] == 0 and r["message_count"] == 0: continue
+                pct = (r["cost"] / total * 100) if total > 0 else 0
+                prev_cost = prev_services.get(r["service"], 0)
+                card_mom = ((r["cost"] - prev_cost) / prev_cost * 100) if prev_cost > 0 else (100 if r["cost"] > 0 else 0)
                 cards.append({
                     "service": r["service"],
-                    "label": SERVICE_LABELS.get(r["service"], r["service"]),
-                    "color": SERVICE_COLORS.get(r["service"], "#6b7280"),
+                    "label": LABELS.get(r["service"], r["service"]),
+                    "color": COLORS.get(r["service"], "#6b7280"),
                     "message_count": r["message_count"],
                     "cost": round(r["cost"], 4),
+                    "prev_cost": round(prev_cost, 4),
+                    "mom_pct": round(card_mom, 1),
                     "pct_of_total": round(pct, 1),
                 })
-            result[month] = {"total": round(total,4), "prev_total": round(pt,4),
-                "mom_pct": round(mom,1), "prev_month": prev, "cards": cards}
+            # Build trend data (last 6 months per service)
+            trend_months = months[i:i+6][::-1]
+            services_with_data = list(set(r["service"] for r in rows if r["cost"] > 0))[:5]
+            trend = {"months": [m for m in trend_months], "series": []}
+            for svc in services_with_data:
+                values = []
+                for tm in trend_months:
+                    tr = conn.execute("SELECT COALESCE(cost,0) c FROM usage_monthly WHERE month=? AND service=?", (tm, svc)).fetchone()
+                    values.append(round(tr["c"] if tr else 0, 4))
+                trend["series"].append({"service": svc, "label": LABELS.get(svc, svc), "color": COLORS.get(svc, "#6b7280"), "values": values})
+            result[month] = {
+                "total": round(total, 2), "prev_total": round(pt, 2),
+                "mom_pct": round(mom, 1), "prev_month": prev,
+                "cards": cards, "trend": trend,
+            }
         conn.close()
-        ls = last_fetch_time.strftime("%Y-%m-%d %H:%M UTC") if last_fetch_time else "Fetching..."
+        ls = last_fetch.strftime("%Y-%m-%d %H:%M UTC") if last_fetch else "Fetching..."
         return jsonify({"months": months, "data": result, "last_sync": ls})
     except Exception as e:
         print(f"API error: {e}")
@@ -212,92 +195,269 @@ def api_data():
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Credit Usage — QD Academy</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f6f9;min-height:100vh}
-    .header{background:#fff;border-bottom:1px solid #e5e7eb;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
-    .header h1{font-size:18px;font-weight:600;color:#111827}
-    .sub{font-size:13px;color:#6b7280;margin-top:2px}
-    .sync{font-size:12px;color:#9ca3af}
-    .tabs-wrap{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;overflow-x:auto}
-    .tabs{display:flex;gap:4px;min-width:max-content}
-    .tab{padding:14px 20px;font-size:14px;font-weight:500;color:#6b7280;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
-    .tab.active{color:#4f46e5;border-bottom-color:#4f46e5;font-weight:600}
-    .content{padding:24px;max-width:960px;margin:0 auto}
-    .banner{margin-bottom:24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-    .amount{font-size:26px;font-weight:700;color:#111827}
-    .lbl{font-size:15px;color:#6b7280}
-    .badge{display:inline-flex;align-items:center;padding:4px 10px;border-radius:20px;font-size:13px;font-weight:600}
-    .up{background:#dcfce7;color:#16a34a}.down{background:#fee2e2;color:#dc2626}.flat{background:#f3f4f6;color:#6b7280}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
-    .card{background:#fff;border-radius:12px;padding:20px;border:1px solid #e5e7eb}
-    .card:hover{box-shadow:0 4px 12px rgba(0,0,0,.08)}
-    .ct{font-size:13px;font-weight:600;color:#374151;margin-bottom:10px}
-    .cr{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
-    .cc{font-size:22px;font-weight:700}.cp{font-size:12px;color:#9ca3af}
-    .bg{height:5px;background:#f3f4f6;border-radius:99px;margin-bottom:8px;overflow:hidden}
-    .fill{height:100%;border-radius:99px}
-    .pct{font-size:12px;color:#6b7280}.cnt{font-size:11px;color:#9ca3af;margin-top:4px}
-    .empty{text-align:center;padding:60px;color:#9ca3af}
-    .loading{text-align:center;padding:60px;color:#6b7280}
-  </style>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Credit Usage — GHL Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f0f2f7;--surface:#fff;--border:#e5e7eb;
+  --text:#111827;--muted:#6b7280;--subtle:#9ca3af;
+  --primary:#4f46e5;--success:#16a34a;--danger:#dc2626;
+  --radius:14px;--shadow:0 1px 3px rgba(0,0,0,.08),0 4px 16px rgba(0,0,0,.04);
+}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+
+/* Header */
+.header{background:var(--surface);border-bottom:1px solid var(--border);padding:18px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.header-left h1{font-size:17px;font-weight:700;color:var(--text);letter-spacing:-.3px}
+.header-left p{font-size:12px;color:var(--muted);margin-top:2px}
+.sync-badge{font-size:11px;color:var(--subtle);background:#f9fafb;border:1px solid var(--border);padding:4px 10px;border-radius:20px;font-family:'DM Mono',monospace}
+
+/* Month tabs */
+.tabs-bar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;overflow-x:auto;scrollbar-width:none}
+.tabs-bar::-webkit-scrollbar{display:none}
+.tabs{display:flex;gap:2px;min-width:max-content}
+.tab{padding:14px 18px;font-size:13px;font-weight:500;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s;letter-spacing:-.1px}
+.tab:hover{color:var(--primary)}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:600}
+
+/* Content */
+.content{padding:24px 28px;max-width:1100px;margin:0 auto}
+
+/* Summary row */
+.summary{display:flex;align-items:center;gap:14px;margin-bottom:24px;flex-wrap:wrap}
+.summary-total{font-size:28px;font-weight:700;color:var(--text);letter-spacing:-1px}
+.summary-label{font-size:14px;color:var(--muted)}
+.mom-chip{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600}
+.chip-up{background:#dcfce7;color:#15803d}
+.chip-down{background:#fee2e2;color:#b91c1c}
+.chip-flat{background:#f3f4f6;color:var(--muted)}
+
+/* Trend chart */
+.chart-card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);padding:20px 24px;margin-bottom:24px;box-shadow:var(--shadow)}
+.chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.chart-title{font-size:13px;font-weight:600;color:var(--text)}
+.chart-legend{display:flex;gap:14px;flex-wrap:wrap}
+.legend-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)}
+.legend-dot{width:8px;height:8px;border-radius:50%}
+.chart-wrap{position:relative;height:160px}
+svg.chart{width:100%;height:100%}
+
+/* Cards grid */
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);padding:18px 20px;box-shadow:var(--shadow);transition:transform .15s,box-shadow .15s;cursor:default}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 20px rgba(0,0,0,.1)}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-name{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.card-chip{font-size:11px;font-weight:600;padding:3px 8px;border-radius:10px}
+.card-body{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
+.card-cost{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.card-prev{font-size:12px;color:var(--subtle)}
+.bar-bg{height:4px;background:#f3f4f6;border-radius:99px;margin-bottom:10px;overflow:hidden}
+.bar-fill{height:100%;border-radius:99px;transition:width .6s cubic-bezier(.4,0,.2,1)}
+.card-footer{display:flex;justify-content:space-between;align-items:center}
+.card-pct{font-size:12px;color:var(--muted)}
+.card-txn{font-size:11px;color:var(--subtle);font-family:'DM Mono',monospace}
+
+/* Empty / loading */
+.empty{text-align:center;padding:80px 20px;color:var(--subtle)}
+.empty h2{font-size:18px;font-weight:600;color:var(--muted);margin-bottom:8px}
+.loading{text-align:center;padding:80px;color:var(--muted);font-size:14px}
+.spinner{display:inline-block;width:24px;height:24px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;margin-bottom:12px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
 </head>
 <body>
+
 <div class="header">
-  <div><h1>Credit Usage Dashboard</h1><div class="sub">QD Academy — GoHighLevel</div></div>
-  <div class="sync" id="sync">Loading...</div>
+  <div class="header-left">
+    <h1>Credit Usage Dashboard</h1>
+    <p>GoHighLevel — Sub-Account Overview</p>
+  </div>
+  <div class="sync-badge" id="sync">Syncing...</div>
 </div>
-<div class="tabs-wrap"><div class="tabs" id="tabs"></div></div>
-<div class="content"><div id="main" class="loading">Loading data...</div></div>
+
+<div class="tabs-bar">
+  <div class="tabs" id="tabs"></div>
+</div>
+
+<div class="content">
+  <div id="main" class="loading">
+    <div class="spinner"></div><br>Loading data...
+  </div>
+</div>
+
 <script>
-let D={},M=[],A=null;
-const N=m=>{const[y,mo]=m.split('-');return['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][+mo-1]+' '+y};
-const tabs=()=>document.getElementById('tabs').innerHTML=M.map(m=>`<div class="tab ${m===A?'active':''}" onclick="sw('${m}')">${N(m)}</div>`).join('');
-const sw=m=>{A=m;tabs();render()};
-const render=()=>{
-  const el=document.getElementById('main'),d=D[A];
-  if(!d){el.innerHTML='<div class="empty"><h2>No data</h2></div>';return}
-  let mom='';
-  if(d.prev_month){const p=d.mom_pct,c=p>0?'up':p<0?'down':'flat',s=p>0?'↑':p<0?'↓':'→',a=Math.abs(p);
-    mom=`<span class="badge ${c}">${a>100?'>100%':a.toFixed(1)+'%'} ${s}</span><span class="lbl">vs ${N(d.prev_month)}</span>`}
-  const cards=d.cards.length?'<div class="grid">'+d.cards.map(c=>`
-    <div class="card"><div class="ct">${c.label}</div>
-    <div class="cr"><span class="cc" style="color:${c.color}">$${c.cost.toFixed(4)}</span><span class="cp">from $0</span></div>
-    <div class="bg"><div class="fill" style="width:${c.pct_of_total}%;background:${c.color}"></div></div>
-    <div class="pct">${c.pct_of_total}% of total</div>
-    <div class="cnt">${c.message_count.toLocaleString()} transactions</div></div>`).join('')+'</div>':
-    '<div class="empty"><h2>No usage this month</h2></div>';
-  el.innerHTML=`<div class="banner"><span class="amount">$${d.total.toFixed(2)}</span><span class="lbl">total for ${N(A)}</span>${mom}</div>${cards}`;
-};
+let D={}, M=[], A=null;
+
+function fmtMonth(m){
+  const[y,mo]=m.split('-');
+  return['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][+mo-1]+' '+y;
+}
+function fmtMom(pct){
+  if(pct===null||pct===undefined) return '';
+  const cls=pct>0?'chip-up':pct<0?'chip-down':'chip-flat';
+  const sign=pct>0?'+':pct<0?'':'+';
+  const arrow=pct>0?'↑':pct<0?'↓':'→';
+  const abs=Math.abs(pct);
+  const label=abs>100?(pct>0?'>+100%':'<-100%'):`${sign}${abs.toFixed(2)}%`;
+  return `<span class="mom-chip ${cls}">${label} ${arrow}</span>`;
+}
+
+function renderTabs(){
+  document.getElementById('tabs').innerHTML=M.map(m=>
+    `<div class="tab${m===A?' active':''}" onclick="sw('${m}')">${fmtMonth(m)}</div>`
+  ).join('');
+}
+
+function sw(m){A=m;renderTabs();render()}
+
+function buildChart(trend){
+  if(!trend||!trend.series||!trend.series.length) return '';
+  const months=trend.months;
+  const series=trend.series;
+  const W=600,H=140,PAD={t:10,r:10,b:30,l:40};
+  const plotW=W-PAD.l-PAD.r, plotH=H-PAD.t-PAD.b;
+
+  // Find max value
+  let maxV=0;
+  series.forEach(s=>s.values.forEach(v=>{if(v>maxV)maxV=v}));
+  if(maxV===0) return '';
+  maxV=maxV*1.15;
+
+  const xStep=plotW/(months.length-1||1);
+  const yScale=v=>(plotH-(v/maxV)*plotH);
+
+  let paths='', dots='';
+  series.forEach(s=>{
+    const pts=s.values.map((v,i)=>`${PAD.l+i*xStep},${PAD.t+yScale(v)}`);
+    paths+=`<path d="M${pts.join('L')}" fill="none" stroke="${s.color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" opacity=".9"/>`;
+    s.values.forEach((v,i)=>{
+      if(i===s.values.length-1)
+        dots+=`<circle cx="${PAD.l+i*xStep}" cy="${PAD.t+yScale(v)}" r="4" fill="${s.color}" stroke="#fff" stroke-width="2"/>`;
+    });
+  });
+
+  // X axis labels
+  let xlabels='';
+  months.forEach((m,i)=>{
+    xlabels+=`<text x="${PAD.l+i*xStep}" y="${H-6}" text-anchor="middle" font-size="10" fill="#9ca3af">${fmtMonth(m).split(' ')[0]}</text>`;
+  });
+
+  // Y axis
+  const yTicks=3;
+  let ylines='';
+  for(let i=0;i<=yTicks;i++){
+    const y=PAD.t+(plotH/yTicks)*i;
+    const val=(maxV*(1-i/yTicks));
+    ylines+=`<line x1="${PAD.l}" y1="${y}" x2="${PAD.l+plotW}" y2="${y}" stroke="#f3f4f6" stroke-width="1"/>`;
+    if(i<yTicks) ylines+=`<text x="${PAD.l-4}" y="${y+4}" text-anchor="end" font-size="9" fill="#9ca3af">$${val.toFixed(0)}</text>`;
+  }
+
+  const legend=series.map(s=>
+    `<div class="legend-item"><div class="legend-dot" style="background:${s.color}"></div>${s.label}</div>`
+  ).join('');
+
+  return `
+    <div class="chart-card">
+      <div class="chart-header">
+        <span class="chart-title">Spending Trend</span>
+        <div class="chart-legend">${legend}</div>
+      </div>
+      <div class="chart-wrap">
+        <svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+          ${ylines}${paths}${dots}${xlabels}
+        </svg>
+      </div>
+    </div>`;
+}
+
+function render(){
+  const main=document.getElementById('main');
+  const d=D[A];
+  if(!d){main.innerHTML='<div class="empty"><h2>No data for this month</h2></div>';return}
+
+  const momChip=d.prev_month?fmtMom(d.mom_pct):'';
+  const prevLabel=d.prev_month?`<span class="summary-label">vs ${fmtMonth(d.prev_month)}</span>`:'';
+
+  const chart=buildChart(d.trend);
+
+  let cards='';
+  if(!d.cards.length){
+    cards='<div class="empty"><h2>No usage recorded this month</h2></div>';
+  } else {
+    cards='<div class="cards-grid">'+d.cards.map(c=>{
+      const momChip=fmtMom(c.mom_pct);
+      const prevTxt=c.prev_cost>0?`from $${c.prev_cost.toFixed(2)}`:'from $0';
+      return `
+        <div class="card">
+          <div class="card-header">
+            <span class="card-name">${c.label}</span>
+            ${momChip}
+          </div>
+          <div class="card-body">
+            <span class="card-cost" style="color:${c.color}">$${c.cost.toFixed(2)}</span>
+            <span class="card-prev">${prevTxt}</span>
+          </div>
+          <div class="bar-bg">
+            <div class="bar-fill" style="width:${c.pct_of_total}%;background:${c.color}"></div>
+          </div>
+          <div class="card-footer">
+            <span class="card-pct">${c.pct_of_total}% of total</span>
+            <span class="card-txn">${c.message_count.toLocaleString()} msgs</span>
+          </div>
+        </div>`;
+    }).join('')+'</div>';
+  }
+
+  main.innerHTML=`
+    <div class="summary">
+      <span class="summary-total">$${d.total.toFixed(2)}</span>
+      <span class="summary-label">total for ${fmtMonth(A)}</span>
+      ${momChip}
+      ${prevLabel}
+    </div>
+    ${chart}
+    ${cards}`;
+}
+
 async function load(){
   try{
-    const r=await fetch('/api/data'),j=await r.json();
-    if(j.error){document.getElementById('main').innerHTML=`<div class="empty"><h2>${j.error}</h2></div>`;return}
+    const r=await fetch('/api/data');
+    const j=await r.json();
+    if(j.error){
+      document.getElementById('main').innerHTML=`<div class="empty"><h2>${j.error}</h2></div>`;
+      return;
+    }
     M=j.months||[];D=j.data||{};
     document.getElementById('sync').textContent='Last synced: '+(j.last_sync||'pending');
-    if(!M.length){document.getElementById('main').innerHTML='<div class="empty"><h2>Fetching from GHL...</h2><p>Check back in 2 minutes.</p></div>';return}
-    if(!A||!M.includes(A))A=M[0];tabs();render();
-  }catch(e){document.getElementById('main').innerHTML=`<div class="empty"><h2>${e.message}</h2></div>`}
+    if(!M.length){
+      document.getElementById('main').innerHTML='<div class="empty"><h2>Fetching from GHL...</h2><p>Check back in 2 minutes.</p></div>';
+      return;
+    }
+    if(!A||!M.includes(A))A=M[0];
+    renderTabs();render();
+  }catch(e){
+    document.getElementById('main').innerHTML=`<div class="empty"><h2>Failed to load: ${e.message}</h2></div>`;
+  }
 }
-load();setInterval(load,15*60*1000);
+
+load();
+setInterval(load,15*60*1000);
 </script>
 </body>
 </html>"""
 
 @app.route("/")
-def index():
-    return render_template_string(DASHBOARD_HTML)
+def index(): return render_template_string(DASHBOARD_HTML)
 
 def scheduler():
     time.sleep(5)
     while True:
-        try:
-            run_fetch()
-        except Exception as e:
-            print(f"Scheduler error: {e}")
+        try: run_fetch()
+        except Exception as e: print(f"Scheduler error: {e}")
         time.sleep(15*60)
 
 threading.Thread(target=scheduler, daemon=True).start()
