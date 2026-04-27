@@ -148,7 +148,7 @@ def run_fetch():
 
     now = datetime.now(timezone.utc)
     # Fetch 365 days to ensure we capture current year
-    start_ms = int((now - timedelta(days=365)).timestamp() * 1000)
+    start_ms = int((now - timedelta(days=90)).timestamp() * 1000)
     end_ms = int(now.timestamp() * 1000)
 
     # Get ALL conversations with pagination
