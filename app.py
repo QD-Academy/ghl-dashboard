@@ -272,7 +272,7 @@ def run_fetch():
         conn = get_db()
         has_pdf = conn.execute("SELECT COUNT(*) c FROM usage_monthly WHERE month=? AND source='pdf'", (f"{yr}-{mo:02d}",)).fetchone()["c"]
         conn.close()
-        if has_pdf > 0:
+        if has_pdf > 0 and f"{yr}-{mo:02d}" != '2026-03':
             print(f"  {yr}-{mo:02d}: skip (PDF)", flush=True); continue
         days_in = calendar.monthrange(yr, mo)[1]
         s_ms = int(datetime(yr, mo, 1, tzinfo=timezone.utc).timestamp() * 1000)
