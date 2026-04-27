@@ -173,11 +173,11 @@ def upload_pdf():
 def import_hardcoded():
     month = request.args.get("month","2026-03")
     DATA = [
-        ("email",162375,106.32),
-        ("email_verification",5629,13.99),
+        ("email",157508,106.32),
+        ("email_verification",5597,13.99),
         ("workflow_premium",677,6.77),
-        ("email_notification",679,0.06),
-        ("whatsapp_marketing",8088,1.00),
+        ("whatsapp_marketing",17,1.00),
+        ("email_notification",88,0.06),
     ]
     conn = get_db()
     conn.execute("DELETE FROM usage_monthly WHERE month=?",(month,))
