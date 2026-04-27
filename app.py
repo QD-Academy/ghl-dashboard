@@ -188,13 +188,6 @@ def import_hardcoded():
         ],
     }
     DATA = DATA_BY_MONTH.get(month, DATA_BY_MONTH["2026-03"])
-    DATA = [
-        ("email",157508,106.32),
-        ("email_verification",5597,13.99),
-        ("workflow_premium",677,6.77),
-        ("whatsapp_marketing",17,1.00),
-        ("email_notification",88,0.06),
-    ]
     conn = get_db()
     conn.execute("DELETE FROM usage_monthly WHERE month=?",(month,))
     for svc,qty,cost in DATA:
