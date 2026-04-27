@@ -80,90 +80,67 @@ def parse_pdf(pdf_bytes):
         from pdfminer.high_level import extract_text
         text = extract_text(io.BytesIO(pdf_bytes))
 
-    print(f"PDF: {len(text)} chars", flush=True)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    print("Lines sample:", lines[:30], flush=True)
+    print("Lines:", lines[:50], flush=True)
 
-    # GHL PDF format: ITEM NAME | UNIT PRICE | QTY | TOTAL
-    # Each row appears as separate lines in extracted text
-    # We find service name then scan forward for the pattern:
-    # $X.XXXXXX (unit price), integer (qty), $X.XX (total)
-    
     SVCS = [
-        ("content ai", "content_ai"),
-        ("whatsapp utility", "whatsapp_utility"),
-        ("whatsapp marketing", "whatsapp_marketing"),
-        ("workflow - premium", "workflow_premium"),
-        ("workflow premium", "workflow_premium"),
-        ("email notifications", "email_notification"),
-        ("lc email verification", "email_verification"),
-        ("conversation and voice", "conversation_voice_ai"),
-        ("conversation & voice", "conversation_voice_ai"),
-        ("reviews ai", "reviews_ai"),
-        ("emails", "email"),
-        ("sms", "sms"),
-        ("calls", "calls"),
+        ("content ai","content_ai"),
+        ("whatsapp utility","whatsapp_utility"),
+        ("whatsapp marketing","whatsapp_marketing"),
+        ("workflow - premium","workflow_premium"),
+        ("workflow premium","workflow_premium"),
+        ("email notifications","email_notification"),
+        ("lc email verification","email_verification"),
+        ("conversation and voice","conversation_voice_ai"),
+        ("conversation & voice","conversation_voice_ai"),
+        ("reviews ai","reviews_ai"),
+        ("emails","email"),
+        ("sms","sms"),
+        ("calls","calls"),
     ]
 
-    results = []
+    qty_idx = next((i for i,l in enumerate(lines) if l.upper()=="QTY"), None)
+    total_idx = next((i for i,l in enumerate(lines) if l.upper()=="TOTAL"), None)
+    print(f"QTY at {qty_idx}, TOTAL at {total_idx}", flush=True)
+
+    svc_keys = []
     seen = set()
-
-    for i, line in enumerate(lines):
+    for line in lines[:(qty_idx or 999)]:
         ll = line.lower()
-        # Skip header lines
-        if any(h in ll for h in ["item name","unit price","products","total products","total charged","amount due","billed to","duration","start date","end date","highlevel","stripe","ein:"]):
-            continue
-
-        matched = None
         for pat, key in SVCS:
-            if pat in ll and key not in seen:
-                matched = (pat, key)
+            if pat in ll and key not in seen and "item name" not in ll:
+                svc_keys.append(key)
+                seen.add(key)
                 break
 
-        if matched:
-            pat, key = matched
-            # Scan next 10 lines for unit_price, qty, total
-            unit_price = None
-            qty = None
-            total = None
-            
-            for j in range(i+1, min(i+11, len(lines))):
-                l = lines[j].strip()
-                
-                # Unit price: starts with $ and has 4+ decimal places
-                if unit_price is None:
-                    m = re.match(r'^\$?([\d]+\.[\d]{4,})$', l)
-                    if m:
-                        unit_price = float(m.group(1))
-                        continue
-                
-                # Qty: plain integer
-                if qty is None and unit_price is not None:
-                    m = re.match(r'^([\d,]+)$', l)
-                    if m:
-                        v = int(l.replace(',',''))
-                        if v > 0:
-                            qty = v
-                        continue
-                
-                # Total: $X.XX with exactly 2 decimal places
-                if total is None and qty is not None:
-                    m = re.match(r'^\$?([\d,]+\.\d{2})$', l)
-                    if m:
-                        total = float(m.group(1).replace(',',''))
-                        break
-                        
-                # Stop if we hit another service name
-                for p2, _ in SVCS:
-                    if p2 in l.lower():
-                        break
+    qtys = []
+    if qty_idx and total_idx:
+        for l in lines[qty_idx+1:total_idx]:
+            if re.match(r"^[\d,]+$", l):
+                qtys.append(int(l.replace(",","")))
 
-            if total and total > 0:
-                results.append((key, qty or 0, total))
-                seen.add(key)
-                print(f"  OK: {key} unit={unit_price} qty={qty} total={total}", flush=True)
-            else:
-                print(f"  SKIP: {key} - unit={unit_price} qty={qty} total={total}", flush=True)
+    totals = []
+    if total_idx:
+        for l in lines[total_idx+1:]:
+            m = re.match(r"^\$?([\d,]+\.\d{2})$", l)
+            if m:
+                v = float(m.group(1).replace(",",""))
+                if v > 0:
+                    totals.append(v)
+            if "total products" in l.lower() or "total charged" in l.lower():
+                break
+
+    print(f"Services: {svc_keys}", flush=True)
+    print(f"Qtys: {qtys}", flush=True)
+    print(f"Totals: {totals}", flush=True)
+
+    results = []
+    for i, svc in enumerate(svc_keys):
+        qty = qtys[i] if i < len(qtys) else 0
+        total = totals[i] if i < len(totals) else 0
+        if total > 0:
+            results.append((svc, qty, total))
+            print(f"  OK: {svc} qty={qty} total={total}", flush=True)
 
     return results
 
