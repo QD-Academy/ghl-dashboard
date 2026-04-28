@@ -314,6 +314,18 @@ def scheduler():
 threading.Thread(target=scheduler, daemon=True).start()
 
 if __name__ == "__main__":
+    # Auto-import hardcoded data on startup
+    with app.app_context():
+        for month, data in DATA_BY_MONTH.items():
+            conn = get_db()
+            existing = conn.execute("SELECT COUNT(*) c FROM usage_monthly WHERE month=? AND source='pdf'", (month,)).fetchone()["c"]
+            conn.close()
+            if existing == 0:
+                for svc, qty, cost in data:
+                    upsert(month, svc, qty, cost, "pdf")
+                print(f"Auto-imported {month}", flush=True)
+            else:
+                print(f"Already has data for {month}, skipping", flush=True)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
 
