@@ -169,24 +169,25 @@ def upload_pdf():
         import traceback; traceback.print_exc()
         return jsonify({"error":str(e)}),500
 
+DATA_BY_MONTH = {
+    "2026-03": [
+        ("email",157508,106.32),
+        ("email_verification",5597,13.99),
+        ("workflow_premium",677,6.77),
+        ("whatsapp_marketing",17,1.00),
+        ("email_notification",88,0.06),
+    ],
+    "2026-04": [
+        ("email",166843,112.62),
+        ("workflow_premium",2249,22.49),
+        ("email_verification",2294,5.74),
+        ("email_notification",56,0.04),
+    ],
+}
+
 @app.route("/api/import-hardcoded")
 def import_hardcoded():
     month = request.args.get("month","2026-03")
-    DATA_BY_MONTH = {
-        "2026-03": [
-            ("email",157508,106.32),
-            ("email_verification",5597,13.99),
-            ("workflow_premium",677,6.77),
-            ("whatsapp_marketing",17,1.00),
-            ("email_notification",88,0.06),
-        ],
-        "2026-04": [
-            ("email",166843,112.62),
-            ("workflow_premium",2249,22.49),
-            ("email_verification",2294,5.74),
-            ("email_notification",56,0.04),
-        ],
-    }
     DATA = DATA_BY_MONTH.get(month, DATA_BY_MONTH["2026-03"])
     conn = get_db()
     conn.execute("DELETE FROM usage_monthly WHERE month=?",(month,))
