@@ -178,10 +178,13 @@ DATA_BY_MONTH = {
         ("email_notification",88,0.06),
     ],
     "2026-04": [
-        ("email",166843,112.62),
-        ("workflow_premium",2249,22.49),
-        ("email_verification",2294,5.74),
+        ("email",169283,129.66),
+        ("workflow_premium",2416,24.18),
+        ("email_verification",2461,6.16),
         ("email_notification",56,0.04),
+    ],
+    "2026-05": [
+        ("email",5901,3.98),
     ],
 }
 
