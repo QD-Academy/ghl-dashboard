@@ -174,7 +174,10 @@ DATA_BY_MONTH = {
         ("whatsapp_marketing",116,16.4942),
         ("whatsapp_utility",212,4.6534),
     ],
-    "2026-04": [],
+    "2026-04": [
+        ("whatsapp_marketing",205,29.1492),
+        ("whatsapp_utility",186,4.0827),
+    ],
     "2026-05": [],
 }
 
