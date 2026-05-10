@@ -178,7 +178,10 @@ DATA_BY_MONTH = {
         ("whatsapp_marketing",205,29.1492),
         ("whatsapp_utility",186,4.0827),
     ],
-    "2026-05": [],
+    "2026-05": [
+        ("whatsapp_marketing",45,6.3986),
+        ("whatsapp_utility",65,1.4268),
+    ],
 }
 
 @app.route("/api/import-hardcoded")
