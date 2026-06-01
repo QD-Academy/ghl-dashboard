@@ -313,6 +313,17 @@ def scheduler():
 
 threading.Thread(target=scheduler, daemon=True).start()
 
+# Auto-import hardcoded data on startup
+for month, data in DATA_BY_MONTH.items():
+    conn = get_db()
+    existing = conn.execute("SELECT COUNT(*) c FROM usage_monthly WHERE month=? AND source='pdf'",(month,)).fetchone()["c"]
+    conn.close()
+    if existing == 0:
+        for svc,qty,cost in data:
+            upsert(month,svc,qty,cost,"pdf")
+        print(f"Auto-imported {month}",flush=True)
+
+
 if __name__ == "__main__":
     # Auto-import hardcoded data on startup
     with app.app_context():
